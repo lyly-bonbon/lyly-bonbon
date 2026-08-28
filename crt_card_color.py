@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Generate a colour CRT-style profile card PNG for a GitHub profile README.
+"""Render a CRT-style profile card for a GitHub profile README.
 
-Usage:  python3 crt_card_color.py <avatar.png> [out.png]
-Edit CONFIG / THEME below.
+    python3 crt_card_color.py <avatar.jpg> card.png    # single still frame
+    python3 crt_card_color.py <avatar.jpg> card.gif    # animated loop
+
+Animated: a meteor streaks past, the cursor blinks, the scanlines drift and
+the tube flickers. The loop is built to be seamless.
 """
 import sys
 import numpy as np
@@ -21,34 +24,46 @@ CONFIG = {
 }
 
 THEME = {
-    "screen":  (12, 14, 26),      # CRT background
-    "panel":   (250, 245, 238),   # backdrop behind the avatar
-    "label":   (232, 122, 66),    # "Name:" etc
+    "screen":  (12, 14, 26),
+    "panel":   (250, 245, 238),
+    "label":   (232, 122, 66),
     "value":   (240, 234, 224),
     "prompt":  (108, 168, 255),
-    "rail":    (196, 206, 232),   # bar under the swatches
+    "rail":    (196, 206, 232),
     "bezel":   (20, 20, 24),
 }
-
 METEOR_CORE = (255, 252, 240)
 METEOR_TAIL = (86, 132, 226)
 
 FONT_PATH = "/System/Library/Fonts/Menlo.ttc"
 FONT_SIZE = 34
-LINE_H = 60        # vertical spacing between rows
-LABEL_GAP = 5     # blank chars between 'Name:' and its value
+LINE_H = 60
+LABEL_GAP = 5
 
-PIXEL = 4                     # size of one dithered pixel block
-AV_COLS, AV_ROWS = 190, 172   # avatar resolution in blocks (match your art's aspect)
-LEVELS = 6                    # quantisation steps per RGB channel
-LINEART = True                # keep thin strokes when downscaling
+PIXEL = 4
+AV_COLS, AV_ROWS = 190, 172
+LEVELS = 6
+LINEART = True
 PAD = 46
+
+OUT_W = 900              # final pixel width of the card
+FRAMES = 48              # multiple of 4 keeps the scanline drift seamless
+FRAME_MS = 60
+METEOR_FRAMES = 16       # how long one fly-past lasts
+N_STARS = 70
+
+# Global per-frame changes (drifting scanlines, tube flicker) touch every pixel
+# and defeat the GIF's frame-to-frame compression. Off = far smaller file.
+SCAN_DRIFT = False
+FLICKER_AMT = 0.0
 
 BAYER = np.array([
     [0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5],
 ], dtype=float) / 16.0
 LUM = np.array([0.299, 0.587, 0.114])
 
+
+# ---------------------------------------------------------------- avatar ---
 
 def _crop_to_aspect(im, tw, th):
     w, h = im.size
@@ -73,7 +88,7 @@ def dither(path, cols, rows, levels=LEVELS):
     else:
         a = np.asarray(im.resize((cols, rows), Image.LANCZOS), dtype=float)
 
-    a = np.clip((a / 255.0 - 0.5) * 1.12 + 0.5, 0, 1)                 # contrast
+    a = np.clip((a / 255.0 - 0.5) * 1.12 + 0.5, 0, 1)
     q = a * (levels - 1)
     base = np.floor(q)
     thr = np.tile(BAYER, (rows // 4 + 1, cols // 4 + 1))[:rows, :cols][..., None]
@@ -83,97 +98,114 @@ def dither(path, cols, rows, levels=LEVELS):
     return Image.fromarray(rgb).resize((cols * PIXEL, rows * PIXEL), Image.NEAREST)
 
 
-def draw_sky(screen, box, seed=11):
-    """A few faint stars and one meteor streaking down-left across `box`."""
+# ------------------------------------------------------------------- sky ---
+
+def star_field(box, n=N_STARS, seed=11):
+    """Fixed star positions + a per-star twinkle phase."""
     x0, y0, x1, y1 = box
+    rng = np.random.default_rng(seed)
+    return [(rng.uniform(x0, x1), rng.uniform(y0, y1),
+             rng.uniform(1.0, 2.6), rng.uniform(40, 170), rng.uniform(0, 1))
+            for _ in range(n)]
+
+
+def draw_sky(screen, box, stars, t, meteor_p):
+    """Stars twinkle; if meteor_p is not None a meteor is mid-flight at that
+    progress (0 = just entering, 1 = leaving)."""
     sky = Image.new("RGBA", screen.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(sky)
-    rng = np.random.default_rng(seed)
 
-    for _ in range(70):
-        sx = rng.uniform(x0, x1)
-        sy = rng.uniform(y0, y1)
-        r = rng.uniform(1.0, 2.6)
-        a = int(rng.uniform(40, 170))
-        d.ellipse([sx - r, sy - r, sx + r, sy + r], fill=(214, 226, 255, a))
+    for sx, sy, r, a, ph in stars:
+        tw = 0.55 + 0.45 * np.sin(2 * np.pi * (2 * t + ph))
+        d.ellipse([sx - r, sy - r, sx + r, sy + r],
+                  fill=(214, 226, 255, int(a * tw)))
 
-    # trail runs from the upper right down to the lower left
-    hx, hy = x0 + (x1 - x0) * 0.20, y0 + (y1 - y0) * 0.82   # head
-    tx_, ty_ = x0 + (x1 - x0) * 0.94, y0 + (y1 - y0) * 0.12  # tail
-    core = np.array(METEOR_CORE, dtype=float)
-    tail = np.array(METEOR_TAIL, dtype=float)
+    if meteor_p is not None:
+        x0, y0, x1, y1 = box
+        # the flight path: enters top-right, exits bottom-left
+        ax, ay = x0 + (x1 - x0) * 1.05, y0 + (y1 - y0) * 0.02
+        bx, by = x0 + (x1 - x0) * 0.05, y0 + (y1 - y0) * 0.95
+        p = -0.15 + meteor_p * 1.30                 # head travels off both ends
+        hx, hy = ax + (bx - ax) * p, ay + (by - ay) * p
+        tl = 0.42                                   # trail length along the path
+        tx_, ty_ = ax + (bx - ax) * (p - tl), ay + (by - ay) * (p - tl)
 
-    steps = 300
-    # two passes: a wide soft halo, then a thin bright core on top of it
-    for r_max, a_max, blur in ((17.0, 60, 7), (5.2, 240, 0)):
-        layer = Image.new("RGBA", screen.size, (0, 0, 0, 0))
-        ld = ImageDraw.Draw(layer)
-        for i in range(steps):
-            t = i / (steps - 1)             # 0 = far tail, 1 = head
-            x = tx_ + (hx - tx_) * t
-            y = ty_ + (hy - ty_) * t
-            r = max(0.5, r_max * t ** 2.1)
-            a = int(a_max * t ** 1.8)
-            c = tuple(int(v) for v in (tail + (core - tail) * t ** 1.4))
-            ld.ellipse([x - r, y - r, x + r, y + r], fill=c + (a,))
-        if blur:
-            layer = layer.filter(ImageFilter.GaussianBlur(blur))
-        sky = Image.alpha_composite(sky, layer)
+        fade = min(1.0, meteor_p / 0.18, (1.0 - meteor_p) / 0.22)
+        fade = max(0.0, fade)
+        core = np.array(METEOR_CORE, dtype=float)
+        tail = np.array(METEOR_TAIL, dtype=float)
 
-    halo = Image.new("RGBA", screen.size, (0, 0, 0, 0))
-    hd = ImageDraw.Draw(halo)
-    for i in range(34, 0, -1):
-        r = i
-        a = int(220 * (1 - i / 34) ** 2.0) + (200 if i <= 4 else 0)
-        hd.ellipse([hx - r, hy - r, hx + r, hy + r],
-                   fill=METEOR_CORE + (min(a, 255),))
-    sky = Image.alpha_composite(sky, halo.filter(ImageFilter.GaussianBlur(4)))
+        steps = 300
+        for r_max, a_max, blur in ((17.0, 60, 7), (5.2, 240, 0)):
+            layer = Image.new("RGBA", screen.size, (0, 0, 0, 0))
+            ld = ImageDraw.Draw(layer)
+            for i in range(steps):
+                s = i / (steps - 1)                 # 0 = far tail, 1 = head
+                x = tx_ + (hx - tx_) * s
+                y = ty_ + (hy - ty_) * s
+                r = max(0.5, r_max * s ** 2.1)
+                a = int(a_max * s ** 1.8 * fade)
+                if a <= 0:
+                    continue
+                c = tuple(int(v) for v in (tail + (core - tail) * s ** 1.4))
+                ld.ellipse([x - r, y - r, x + r, y + r], fill=c + (a,))
+            if blur:
+                layer = layer.filter(ImageFilter.GaussianBlur(blur))
+            sky = Image.alpha_composite(sky, layer)
+
+        halo = Image.new("RGBA", screen.size, (0, 0, 0, 0))
+        hd = ImageDraw.Draw(halo)
+        for i in range(34, 0, -1):
+            a = int(220 * (1 - i / 34) ** 2.0) + (200 if i <= 4 else 0)
+            hd.ellipse([hx - i, hy - i, hx + i, hy + i],
+                       fill=METEOR_CORE + (min(int(a * fade), 255),))
+        sky = Image.alpha_composite(sky, halo.filter(ImageFilter.GaussianBlur(4)))
 
     return Image.alpha_composite(screen.convert("RGBA"), sky).convert("RGB")
 
 
-def barrel(im, k=0.055):
-    """Bulge the image outward like a curved CRT tube."""
-    a = np.asarray(im, dtype=np.uint8)
-    h, w = a.shape[:2]
+# ------------------------------------------------------------------- CRT ---
+
+def barrel_maps(w, h, k=0.055):
+    """Precompute the tube-curvature sample indices once."""
     yy, xx = np.mgrid[0:h, 0:w].astype(float)
     nx, ny = (xx / (w - 1)) * 2 - 1, (yy / (h - 1)) * 2 - 1
     f = 1 - k * (nx ** 2 + ny ** 2)
     sx = np.clip(((nx * f + 1) / 2 * (w - 1)).round(), 0, w - 1).astype(int)
     sy = np.clip(((ny * f + 1) / 2 * (h - 1)).round(), 0, h - 1).astype(int)
-    return Image.fromarray(a[sy, sx])
+    return sy, sx
 
 
-def crt(im):
-    """Chromatic fringing + scanlines + aperture grille + vignette + bloom."""
+def crt(im, scan_offset=0, flicker=1.0, blur=5):
+    """Chromatic fringing + drifting scanlines + grille + vignette + bloom."""
     a = np.asarray(im, dtype=float)
     h, w = a.shape[:2]
 
-    a[:, 1:, 0] = a[:, :-1, 0]          # red lags one column
-    a[:, :-1, 2] = a[:, 1:, 2]          # blue leads one column
+    a[:, 1:, 0] = a[:, :-1, 0]
+    a[:, :-1, 2] = a[:, 1:, 2]
 
-    a *= np.where((np.arange(h) % 4) < 2, 1.0, 0.74)[:, None, None]
+    a *= np.where(((np.arange(h) + scan_offset) % 4) < 2, 1.0, 0.74)[:, None, None]
     pat = np.array([[1.0, 0.92, 0.96], [0.96, 1.0, 0.92], [0.92, 0.96, 1.0]])
-    grille = np.tile(pat, (w // 3 + 1, 1))[:w]
-    a *= grille[None, :, :]
+    a *= np.tile(pat, (w // 3 + 1, 1))[:w][None, :, :]
 
     ny, nx = np.mgrid[0:h, 0:w].astype(float)
     r = np.hypot(nx / (w - 1) * 2 - 1, ny / (h - 1) * 2 - 1)
-    a *= np.clip(1.05 - 0.33 * r ** 2.4, 0, 1)[..., None]
+    a *= np.clip(1.05 - 0.33 * r ** 2.4, 0, 1)[..., None] * flicker
 
     im = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
-    glow = im.filter(ImageFilter.GaussianBlur(9))
+    glow = im.filter(ImageFilter.GaussianBlur(blur))
     b = np.asarray(im, float) + np.asarray(glow, float) * 0.34
     return Image.fromarray(np.clip(b, 0, 255).astype(np.uint8))
 
 
-def build(avatar_path, out_path):
+# ----------------------------------------------------------------- build ---
+
+def build_base(avatar_path):
+    """Everything that never moves: panel, avatar, labels, prompt text."""
     font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
     av = dither(avatar_path, AV_COLS, AV_ROWS)
-
     label_w = max(len(k) for k, _ in CONFIG["lines"]) + LABEL_GAP
 
-    # size the text column to its widest line so nothing runs off the tube
     probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     lab_px = probe.textlength(" " * label_w, font=font)
     val_px = max(probe.textlength(part, font=font)
@@ -191,7 +223,7 @@ def build(avatar_path, out_path):
     tx, ty = ax + av.width + 44, PAD + 4
     for key, val in CONFIG["lines"]:
         d.text((tx, ty), f"{key}:", font=font, fill=THEME["label"])
-        vx = tx + int(d.textlength(" " * label_w, font=font))
+        vx = tx + int(lab_px)
         for i, part in enumerate(val.split("\n")):
             d.text((vx, ty), part, font=font, fill=THEME["value"])
             ty += LINE_H
@@ -204,23 +236,75 @@ def build(avatar_path, out_path):
         d.rectangle([sx - 10, sy + sh, sx + len(CONFIG["swatches"]) * sw + 10, sy + sh + 18],
                     fill=THEME["rail"])
 
-    screen = draw_sky(screen, (tx - 10, ty + 70, W - PAD - 20, H - PAD - 20))
-    d = ImageDraw.Draw(screen)
-
     py = H - PAD - FONT_SIZE - 30
     d.text((PAD + 40, py), CONFIG["prompt"], font=font, fill=THEME["prompt"])
     cx = PAD + 40 + int(d.textlength(CONFIG["prompt"] + " ", font=font))
-    d.rectangle([cx, py - 2, cx + 16, py + FONT_SIZE + 2], fill=THEME["prompt"])
 
-    screen = crt(barrel(screen))
+    box = (tx - 10, ty + 70, W - PAD - 20, H - PAD - 20)
+    return screen, {
+        "W": W, "H": H, "box": box, "stars": star_field(box),
+        "cursor": (cx, py - 2, cx + 16, py + FONT_SIZE + 2),
+        "maps": barrel_maps(W, H),
+        "scale": OUT_W / (W + 68),
+    }
 
-    B = 34
-    card = Image.new("RGB", (W + B * 2, H + B * 2), THEME["bezel"])
+
+def render_frame(base, L, i, animated):
+    t = i / FRAMES
+    meteor_p = i / (METEOR_FRAMES - 1) if animated and i < METEOR_FRAMES else None
+    if not animated:
+        meteor_p = 0.55                       # a nice mid-flight pose for the still
+
+    screen = draw_sky(base.copy(), L["box"], L["stars"], t, meteor_p)
+
+    if not animated or (i // 8) % 2 == 0:     # blinking block cursor
+        ImageDraw.Draw(screen).rectangle(L["cursor"], fill=THEME["prompt"])
+
+    sy, sx = L["maps"]
+    screen = Image.fromarray(np.asarray(screen, dtype=np.uint8)[sy, sx])
+
+    ow = int(L["W"] * L["scale"])
+    oh = int(L["H"] * L["scale"])
+    screen = screen.resize((ow, oh), Image.LANCZOS)
+
+    flicker = 1.0 + FLICKER_AMT * np.sin(2 * np.pi * 3 * t) if animated else 1.0
+    screen = crt(screen, scan_offset=(i % 4) if (animated and SCAN_DRIFT) else 0,
+                 flicker=flicker)
+
+    B = int(34 * L["scale"])
+    card = Image.new("RGB", (ow + B * 2, oh + B * 2), THEME["bezel"])
     mask = Image.new("L", screen.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, W - 1, H - 1], radius=26, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, ow - 1, oh - 1],
+                                           radius=int(26 * L["scale"]), fill=255)
     card.paste(screen, (B, B), mask)
-    card.save(out_path)
-    print(f"wrote {out_path}  ({card.width}x{card.height})")
+    return card
+
+
+def build(avatar_path, out_path):
+    base, L = build_base(avatar_path)
+
+    if not out_path.lower().endswith(".gif"):
+        render_frame(base, L, 0, animated=False).save(out_path)
+        print(f"wrote {out_path}")
+        return
+
+    frames = []
+    for i in range(FRAMES):
+        frames.append(render_frame(base, L, i, animated=True))
+        print(f"  frame {i + 1}/{FRAMES}", end="\r", flush=True)
+    print()
+
+    # one shared palette, sampled across the loop, so colours don't crawl
+    picks = [frames[j] for j in (0, 6, 10, 14, 20, 34)]
+    strip = Image.new("RGB", (picks[0].width * len(picks), picks[0].height))
+    for j, f in enumerate(picks):
+        strip.paste(f, (j * f.width, 0))
+    pal = strip.quantize(colors=192, method=Image.MEDIANCUT)
+
+    qs = [f.quantize(palette=pal, dither=Image.NONE) for f in frames]
+    qs[0].save(out_path, save_all=True, append_images=qs[1:],
+               duration=FRAME_MS, loop=0, optimize=True)
+    print(f"wrote {out_path}  ({qs[0].width}x{qs[0].height}, {FRAMES} frames)")
 
 
 if __name__ == "__main__":
