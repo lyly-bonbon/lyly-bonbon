@@ -42,8 +42,10 @@ LABEL_GAP = 5
 
 PIXEL = 4
 AV_COLS, AV_ROWS = 190, 172
-LEVELS = 6
-LINEART = True
+LEVELS = None            # None -> smooth photo instead of dithered pixels
+LINEART = False
+FEATHER = 140            # px of soft edge that fades the avatar into the screen
+EXPOSURE = 0.82          # tame the highlights so the photo sits in the dark UI
 PAD = 46
 
 OUT_W = 900              # final pixel width of the card
@@ -77,6 +79,9 @@ def _crop_to_aspect(im, tw, th):
 def dither(path, cols, rows, levels=LEVELS):
     """Downscale an image and ordered-dither it to a small RGB palette."""
     im = _crop_to_aspect(Image.open(path).convert("RGB"), cols, rows)
+
+    if levels is None:                     # smooth photo, no pixel grid
+        return im.resize((cols * PIXEL, rows * PIXEL), Image.LANCZOS)
 
     if LINEART:
         # sample at 2x then keep the DARKEST pixel of each 2x2 block, so thin
@@ -177,21 +182,8 @@ def barrel_maps(w, h, k=0.0):
 
 
 def crt(im, scan_offset=0, flicker=1.0, blur=5):
-    """Chromatic fringing + drifting scanlines + grille + vignette + bloom."""
-    a = np.asarray(im, dtype=float)
-    h, w = a.shape[:2]
-
-    a[:, 1:, 0] = a[:, :-1, 0]
-    a[:, :-1, 2] = a[:, 1:, 2]
-
-    a *= np.where(((np.arange(h) + scan_offset) % 4) < 2, 1.0, 0.74)[:, None, None]
-    pat = np.array([[1.0, 0.92, 0.96], [0.96, 1.0, 0.92], [0.92, 0.96, 1.0]])
-    a *= np.tile(pat, (w // 3 + 1, 1))[:w][None, :, :]
-
-    ny, nx = np.mgrid[0:h, 0:w].astype(float)
-    r = np.hypot(nx / (w - 1) * 2 - 1, ny / (h - 1) * 2 - 1)
-    a *= np.clip(1.05 - 0.33 * r ** 2.4, 0, 1)[..., None] * flicker
-
+    """Soft bloom only (scanlines, grille, vignette and fringing are off)."""
+    a = np.asarray(im, dtype=float) * flicker
     im = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
     glow = im.filter(ImageFilter.GaussianBlur(blur))
     b = np.asarray(im, float) + np.asarray(glow, float) * 0.34
@@ -216,8 +208,19 @@ def build_base(avatar_path):
     screen = Image.new("RGB", (W, H), THEME["screen"])
     d = ImageDraw.Draw(screen)
 
+    # map the photo's blacks onto the screen colour and feather the edges so
+    # the avatar dissolves into the background instead of sitting on it
+    bg = np.array(THEME["screen"], dtype=float)
+    a = np.asarray(av, dtype=float) * EXPOSURE
+    av = Image.fromarray(np.clip(bg + a * (255 - bg) / 255, 0, 255).astype(np.uint8))
+    mask = Image.new("L", av.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        [FEATHER, FEATHER, av.width - 1 - FEATHER, av.height - 1 - FEATHER],
+        radius=FEATHER, fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(FEATHER * 0.5))
+
     ax, ay = PAD, PAD
-    screen.paste(av, (ax, ay))
+    screen.paste(av, (ax, ay), mask)
 
     tx, ty = ax + av.width + 44, PAD + 4
     for key, val in CONFIG["lines"]:
