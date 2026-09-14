@@ -166,7 +166,7 @@ def draw_sky(screen, box, stars, t, meteor_p):
 
 # ------------------------------------------------------------------- CRT ---
 
-def barrel_maps(w, h, k=0.055):
+def barrel_maps(w, h, k=0.0):
     """Precompute the tube-curvature sample indices once."""
     yy, xx = np.mgrid[0:h, 0:w].astype(float)
     nx, ny = (xx / (w - 1)) * 2 - 1, (yy / (h - 1)) * 2 - 1
@@ -217,7 +217,6 @@ def build_base(avatar_path):
     d = ImageDraw.Draw(screen)
 
     ax, ay = PAD, PAD
-    d.rectangle([ax - 8, ay - 8, ax + av.width + 7, ay + av.height + 7], fill=THEME["panel"])
     screen.paste(av, (ax, ay))
 
     tx, ty = ax + av.width + 44, PAD + 4
@@ -245,7 +244,7 @@ def build_base(avatar_path):
         "W": W, "H": H, "box": box, "stars": star_field(box),
         "cursor": (cx, py - 2, cx + 16, py + FONT_SIZE + 2),
         "maps": barrel_maps(W, H),
-        "scale": OUT_W / (W + 68),
+        "scale": OUT_W / W,
     }
 
 
@@ -271,13 +270,7 @@ def render_frame(base, L, i, animated):
     screen = crt(screen, scan_offset=(i % 4) if (animated and SCAN_DRIFT) else 0,
                  flicker=flicker)
 
-    B = int(34 * L["scale"])
-    card = Image.new("RGB", (ow + B * 2, oh + B * 2), THEME["bezel"])
-    mask = Image.new("L", screen.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, ow - 1, oh - 1],
-                                           radius=int(26 * L["scale"]), fill=255)
-    card.paste(screen, (B, B), mask)
-    return card
+    return screen
 
 
 def build(avatar_path, out_path):
