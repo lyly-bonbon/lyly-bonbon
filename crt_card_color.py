@@ -41,7 +41,7 @@ LINE_H = 60
 LABEL_GAP = 5
 
 PIXEL = 4
-AV_COLS, AV_ROWS = 190, 172
+AV_COLS, AV_ROWS = 128, 192   # 2:3 portrait, matches the full-body photo
 LEVELS = None            # None -> smooth photo instead of dithered pixels
 LINEART = False
 FEATHER = 140            # px of soft edge that fades the avatar into the screen
