@@ -30,6 +30,9 @@ WALL_LIT, WALL_DARK = (44, 34, 26), (12, 9, 7)
 GOLD, IVORY, MUTED = (200, 164, 98), (240, 229, 206), (172, 152, 120)
 VERMILION = (176, 36, 28)
 
+SKIN_LIFT = 9            # L* added to skin tones (0 = leave the painting as is)
+SKIN_DEYELLOW = 0.45     # share of the skin's yellow (b*) taken out
+
 # painting + frame geometry, in 2x px
 P = 860
 FW, LINER = 44, 8
@@ -115,11 +118,56 @@ def tracked(d, xy, text, font, fill, track):
         x += d.textlength(ch, font=font) + track
 
 
+_M = np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]])
+_WHITE = np.array([0.95047, 1.0, 1.08883])
+
+
+def rgb_to_lab(rgb):
+    c = rgb / 255.0
+    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    xyz = np.einsum("...j,ij->...i", lin, _M) / _WHITE    # einsum: avoids spurious BLAS FP warnings on macOS
+    f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
+    return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], -1)
+
+
+def lab_to_rgb(lab):
+    fy = (lab[..., 0] + 16) / 116
+    f = np.stack([fy + lab[..., 1] / 500, fy, fy - lab[..., 2] / 200], -1)
+    xyz = np.where(f ** 3 > 0.008856, f ** 3, (f - 16 / 116) / 7.787) * _WHITE
+    lin = np.clip(np.einsum("...j,ij->...i", xyz, np.linalg.inv(_M)), 0, 1)
+    c = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * lin ** (1 / 2.4) - 0.055)
+    return np.clip(c * 255, 0, 255)
+
+
+def _ramp(x, lo, hi):
+    return np.clip((x - lo) / (hi - lo), 0, 1)
+
+
+def skin_mask(lab):
+    """Soft mask of lit skin: mid-to-high lightness, skin hue, moderate chroma.
+    The dark ground, navy dress and the saturated red scarf/lips fall outside."""
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    C, h = np.hypot(a, b), np.degrees(np.arctan2(b, a))
+    m = (_ramp(L, 30, 42) * _ramp(h, 22, 34) * (1 - _ramp(h, 62, 76))
+         * _ramp(C, 6, 12) * (1 - _ramp(C, 40, 52)))
+    m = Image.fromarray((m * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(2))
+    return np.asarray(m, dtype=float) / 255
+
+
+def fair_skin(img):
+    """Lighten the skin and take the yellow out of it; everything else untouched."""
+    lab = rgb_to_lab(np.asarray(img, dtype=float))
+    m = skin_mask(lab)
+    lab[..., 0] += SKIN_LIFT * m
+    lab[..., 2] *= 1 - SKIN_DEYELLOW * m
+    return Image.fromarray(lab_to_rgb(lab).astype(np.uint8))
+
+
 def build_base(painting_path):
     """Everything that never moves, downscaled to the output size, plus the
     cursor rectangle in output pixels."""
     img = gilt_frame(wall())
-    img.paste(Image.open(painting_path).convert("RGB").resize((P, P), Image.LANCZOS), (PX, PY))
+    img.paste(fair_skin(Image.open(painting_path).convert("RGB").resize((P, P), Image.LANCZOS)), (PX, PY))
     d = ImageDraw.Draw(img)
 
     y = FY + 30
@@ -184,11 +232,32 @@ def render_frame(base, cursor, motes, i):
     return out
 
 
+def _palette_from(pixels, n):
+    """Median-cut palette of up to n colours for an (N, 3) pixel array."""
+    side = int(np.ceil(np.sqrt(len(pixels))))
+    img = Image.fromarray(np.resize(pixels, (side * side, 3)).reshape(side, side, 3).astype(np.uint8))
+    return np.array(img.quantize(colors=n, method=Image.Quantize.MEDIANCUT).getpalette()[:n * 3]).reshape(-1, 3)
+
+
 def save_gif(base, frames, path):
     """Quantise the static base once (with dithering, so the painting and the
     wall gradient stay smooth), then only remap the pixels each frame changes.
     Static pixels keep identical indices frame to frame, which keeps it small."""
-    q = base.quantize(colors=255, method=Image.Quantize.MEDIANCUT)   # leave a slot for transparency
+    # fixed colour budgets per region, so the gilt frame, the painting and the
+    # skin can't starve one another (255 in all; one slot kept for transparency)
+    box = tuple(int(v / S) for v in (PX, PY, PX + P, PY + P))
+    rgb = np.asarray(base)
+    in_art = np.zeros(rgb.shape[:2], bool)
+    in_art[box[1]:box[3], box[0]:box[2]] = True
+    skin = np.zeros_like(in_art)
+    skin[box[1]:box[3], box[0]:box[2]] = skin_mask(rgb_to_lab(rgb[box[1]:box[3], box[0]:box[2]].astype(float))) > 0.4
+    budget = np.concatenate([_palette_from(rgb[~in_art], 100),
+                             _palette_from(rgb[in_art & ~skin], 95),
+                             _palette_from(rgb[skin], 60)])[:255]
+    budget = np.concatenate([budget, np.repeat(budget[:1], 256 - len(budget), 0)])   # duplicate pad: never picked
+    pal_img = Image.new("P", (1, 1))
+    pal_img.putpalette(budget.astype(np.uint8).flatten().tolist())
+    q = base.quantize(palette=pal_img)
     pal_flat = q.getpalette()
     pal = np.array(pal_flat, dtype=float).reshape(-1, 3)
     base_rgb = np.asarray(base, dtype=np.int16)
